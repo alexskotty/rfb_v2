@@ -1,37 +1,94 @@
+# backend/app/__init__.py
 import os
+import logging
 from flask import Flask, jsonify
-from flask_jwt_extended import JWTManager
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager
 
 
-def create_app():
+jwt = JWTManager()
+
+
+def register_error_handlers(app: Flask) -> None:
+    """
+    Force JSON errors (no HTML pages).
+    """
+    @app.errorhandler(400)
+    def handle_400(e):
+        return jsonify({
+            "error": "bad_request",
+            "message": getattr(e, "description", "Bad request"),
+        }), 400
+
+    @app.errorhandler(401)
+    def handle_401(e):
+        return jsonify({
+            "error": "unauthorized",
+            "message": getattr(e, "description", "Unauthorized"),
+        }), 401
+
+    @app.errorhandler(403)
+    def handle_403(e):
+        return jsonify({
+            "error": "forbidden",
+            "message": getattr(e, "description", "Forbidden"),
+        }), 403
+
+    @app.errorhandler(404)
+    def handle_404(e):
+        return jsonify({
+            "error": "not_found",
+            "message": "Route not found",
+            "path": getattr(e, "name", None),
+        }), 404
+
+    @app.errorhandler(500)
+    def handle_500(e):
+        # Avoid leaking internals; rely on logs for details
+        return jsonify({
+            "error": "server_error",
+            "message": "Internal server error",
+        }), 500
+
+
+def configure_logging(app: Flask) -> None:
+    """
+    Render logs are stdout/stderr. Keep it simple.
+    """
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    app.logger.setLevel(level)
+
+
+def create_app() -> Flask:
     app = Flask(__name__)
 
-    # ----- Config -----
-    # Must exist for JWT. Set JWT_SECRET_KEY in Render env vars.
-    app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "dev-insecure-change-me")
-    app.config["JSON_SORT_KEYS"] = False
+    configure_logging(app)
 
-    # ----- Extensions -----
-    JWTManager(app)
-    CORS(app)
+    # --- Config ---
+    # REQUIRED on Render
+    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "")
+    if not app.config["JWT_SECRET_KEY"]:
+        # Not fatal at import time, but will break JWT creation. Log clearly.
+        app.logger.warning("JWT_SECRET_KEY is not set. Login/JWT will fail until set in env.")
 
-    # ----- Blueprints -----
-    from .routes import bp as api_bp
+    # CORS: lock down later; for now allow web+mobile wrappers to talk to API
+    CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False)
+
+    # JWT
+    jwt.init_app(app)
+
+    # JSON error handlers
+    register_error_handlers(app)
+
+    # --- Blueprints ---
+    # Single blueprint that carries all routes under /api
+    from .routes import api_bp
     app.register_blueprint(api_bp, url_prefix="/api")
 
-    # (optional) canary – remove later
-    try:
-        from .canary import canary_bp
-        app.register_blueprint(canary_bp, url_prefix="/api")
-    except Exception:
-        pass
-
-    # ----- JSON error handler -----
-    @app.errorhandler(Exception)
-    def handle_exception(e):
-        # This prints the full traceback in Render logs
-        app.logger.exception("Unhandled exception")
-        return jsonify({"error": "internal_server_error", "detail": str(e)}), 500
+    # Small “root” sanity (optional)
+    @app.get("/")
+    def root():
+        return jsonify({"service": "rfb-v2-api", "status": "ok"}), 200
 
     return app

@@ -1,638 +1,291 @@
+# backend/app/routes.py
 import os
-import csv
-import io
-from datetime import datetime, timezone
-from functools import wraps
-
-from flask import Blueprint, request, jsonify, current_app
-from flask_jwt_extended import (
-    jwt_required,
-    create_access_token,
-    get_jwt_identity,
-)
-import pyotp
+from typing import Any, Dict, Optional, List
+from urllib.parse import urlparse
 
 import psycopg
 from psycopg.rows import dict_row
-from psycopg.errors import UniqueViolation
 
-bp = Blueprint("api", __name__)
+import pyotp
 
-
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def _now_utc():
-    return datetime.now(timezone.utc)
+from flask import Blueprint, jsonify, request, current_app
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 
 
-def get_db():
+api_bp = Blueprint("api", __name__)
+
+
+# -----------------------------
+# Database helpers (psycopg v3)
+# -----------------------------
+def _get_database_url() -> str:
+    db_url = os.getenv("DATABASE_URL", "")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL env var is not set.")
+    return db_url
+
+
+def _connect():
     """
-    psycopg v3 connection.
-    Expects DATABASE_URL set (Render sets it automatically if you add Postgres).
+    Connect using Render's DATABASE_URL. Supports either:
+    - postgres://  (Render often provides this)
+    - postgresql://
+    psycopg accepts both, but normalize if needed.
     """
-    dsn = os.environ.get("DATABASE_URL")
-    if not dsn:
-        raise RuntimeError("DATABASE_URL is not set")
+    db_url = _get_database_url()
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-    # row_factory=dict_row gives dict rows like RealDictCursor used to.
-    return psycopg.connect(dsn, row_factory=dict_row)
-
-
-def require_json():
-    if not request.is_json:
-        return None, (jsonify({"error": "Request must be application/json"}), 400)
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return None, (jsonify({"error": "Invalid JSON body"}), 400)
-    return data, None
+    # dict_row gives us dicts back from fetchone/fetchall
+    return psycopg.connect(db_url, row_factory=dict_row)
 
 
-def require_file(field_name="file"):
-    if field_name not in request.files:
-        return None, (jsonify({"error": f"Missing file field '{field_name}'"}), 400)
-    f = request.files[field_name]
-    if not f or not f.filename:
-        return None, (jsonify({"error": "No file provided"}), 400)
-    return f, None
-
-
-def parse_csv_upload(uploaded_file):
+def db_get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     """
-    Returns list[dict] from a CSV file upload.
+    Expected users table columns:
+      id, username, totp_secret, role, is_active
     """
-    raw = uploaded_file.read()
-    # handle utf-8-sig for Excel exports
-    text = raw.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    rows = []
-    for r in reader:
-        # normalize keys/values
-        rows.append({(k or "").strip(): (v or "").strip() for k, v in r.items()})
-    return rows
-
-
-def _get_user_by_username(cur, username: str):
-    cur.execute(
-        """
-        SELECT id, username, role, totp_secret, is_active
+    sql = """
+        SELECT id, username, totp_secret, role, is_active
         FROM users
         WHERE username = %s
-        """,
-        (username,),
-    )
-    return cur.fetchone()
-
-
-def _is_admin_role(role_value: str) -> bool:
-    return (role_value or "").lower() == "admin"
-
-
-def admin_required(fn):
-    @wraps(fn)
-    @jwt_required()
-    def wrapper(*args, **kwargs):
-        identity = get_jwt_identity()
-        # We store identity as a dict in token below; support both dict and int
-        user_id = identity.get("user_id") if isinstance(identity, dict) else identity
-
-        conn = get_db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
-                row = cur.fetchone()
-                if not row or not _is_admin_role(row["role"]):
-                    return jsonify({"error": "Admin access required"}), 403
-        finally:
-            conn.close()
-
-        return fn(*args, **kwargs)
-
-    return wrapper
-
-
-# ----------------------------
-# Health
-# ----------------------------
-
-@bp.get("/health")
-def health():
-    return jsonify({"ok": True}), 200
-
-
-# ----------------------------
-# Auth
-# ----------------------------
-
-@bp.post("/auth/login")
-def login():
+        LIMIT 1
     """
-    Passwordless login:
-    Body: { "username": "...", "totp": "123456" }
-    Returns: { "access_token": "...", "role": "...", "user_id": ... }
-    """
-    data, err = require_json()
-    if err:
-        return err
-
-    username = (data.get("username") or "").strip()
-    totp_code = (data.get("totp") or "").strip()
-
-    if not username or not totp_code:
-        return jsonify({"error": "username and totp are required"}), 400
-
-    conn = get_db()
-    try:
+    with _connect() as conn:
         with conn.cursor() as cur:
-            user = _get_user_by_username(cur, username)
-            if not user:
-                return jsonify({"error": "Invalid credentials"}), 401
-            if not user.get("is_active", True):
-                return jsonify({"error": "User is inactive"}), 403
-
-            secret = user.get("totp_secret")
-            if not secret:
-                return jsonify({"error": "User is not enrolled for MFA"}), 403
-
-            if not pyotp.TOTP(secret).verify(totp_code, valid_window=1):
-                return jsonify({"error": "Invalid credentials"}), 401
-
-            identity = {"user_id": user["id"], "role": user["role"], "username": user["username"]}
-            token = create_access_token(identity=identity)
-
-            return jsonify(
-                {
-                    "access_token": token,
-                    "role": user["role"],
-                    "user_id": user["id"],
-                }
-            ), 200
-    finally:
-        conn.close()
+            cur.execute(sql, (username,))
+            row = cur.fetchone()
+            return row
 
 
-# ----------------------------
-# Ref data
-# ----------------------------
-
-@bp.get("/refdata")
-@jwt_required(optional=True)
-def refdata():
+def db_insert_post_job_submission(payload: Dict[str, Any], submitted_by_user_id: int) -> int:
     """
-    Returns reference data used by the app.
+    Minimal insert example.
+    Adapt columns to your actual schema.
     """
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM crew_members ORDER BY id")
-            crew = cur.fetchall()
-
-            cur.execute("SELECT * FROM appliances ORDER BY id")
-            appliances = cur.fetchall()
-
-            cur.execute("SELECT * FROM job_types ORDER BY id")
-            job_types = cur.fetchall()
-
-            cur.execute("SELECT * FROM turnout_types ORDER BY id")
-            turnout_types = cur.fetchall()
-
-            cur.execute("SELECT * FROM equipment_items ORDER BY id")
-            equipment = cur.fetchall()
-
-        return jsonify(
-            {
-                "crew": crew,
-                "appliances": appliances,
-                "job_types": job_types,
-                "turnout_types": turnout_types,
-                "equipment": equipment,
-            }
-        ), 200
-    finally:
-        conn.close()
-
-
-@bp.get("/appliances/<int:appliance_id>/equipment")
-@jwt_required(optional=True)
-def equipment_for_appliance(appliance_id: int):
-    conn = get_db()
-    try:
+    sql = """
+        INSERT INTO post_job_submissions
+            (submitted_by_user_id, job_type_id, turnout_type_id, appliance_id, notes)
+        VALUES
+            (%s, %s, %s, %s, %s)
+        RETURNING id
+    """
+    with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM equipment_items WHERE appliance_id = %s ORDER BY id",
-                (appliance_id,),
+                sql,
+                (
+                    submitted_by_user_id,
+                    payload.get("job_type_id"),
+                    payload.get("turnout_type_id"),
+                    payload.get("appliance_id"),
+                    payload.get("notes"),
+                ),
             )
-            rows = cur.fetchall()
-        return jsonify({"appliance_id": appliance_id, "equipment": rows}), 200
-    finally:
-        conn.close()
+            new_id = cur.fetchone()["id"]
+            conn.commit()
+            return int(new_id)
 
 
-# ----------------------------
-# Admin CSV imports
-# ----------------------------
-
-def _import_appliances(rows):
+def db_list_post_job_submissions(limit: int = 50) -> List[Dict[str, Any]]:
+    sql = """
+        SELECT id, submitted_by_user_id, job_type_id, turnout_type_id, appliance_id, notes, created_at
+        FROM post_job_submissions
+        ORDER BY created_at DESC
+        LIMIT %s
     """
-    Expected columns (case-insensitive):
-    - name (required)
-    Optional:
-    - callsign
-    - active (true/false)
-    """
-    conn = get_db()
-    inserted = 0
-    updated = 0
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (limit,))
+            return cur.fetchall() or []
 
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def json_body() -> Dict[str, Any]:
+    """
+    Safe JSON parsing; returns {} instead of raising.
+    """
+    return request.get_json(silent=True) or {}
+
+
+def require_fields(data: Dict[str, Any], fields: List[str]) -> Optional[str]:
+    """
+    Returns missing field name if any required field missing/blank, else None.
+    """
+    for f in fields:
+        v = data.get(f)
+        if v is None:
+            return f
+        if isinstance(v, str) and not v.strip():
+            return f
+    return None
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@api_bp.get("/_canary")
+def canary():
+    return jsonify({"ok": True, "route": "/api/_canary"}), 200
+
+
+@api_bp.get("/health")
+def health():
+    # Optional: check DB connectivity
+    db_ok = True
+    err = None
     try:
-        with conn:
+        with _connect() as conn:
             with conn.cursor() as cur:
-                for r in rows:
-                    name = r.get("name") or r.get("Name")
-                    if not name:
-                        continue
-                    callsign = r.get("callsign") or r.get("Callsign") or None
-                    active_raw = (r.get("active") or r.get("Active") or "true").lower()
-                    active = active_raw not in ("0", "false", "no", "n")
+                cur.execute("SELECT 1 AS one;")
+                cur.fetchone()
+    except Exception as e:
+        db_ok = False
+        err = str(e)
 
-                    # assumes UNIQUE(name) exists; if not, it will insert duplicates
-                    cur.execute(
-                        """
-                        INSERT INTO appliances (name, callsign, active)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (name) DO UPDATE
-                        SET callsign = EXCLUDED.callsign,
-                            active = EXCLUDED.active
-                        """,
-                        (name, callsign, active),
-                    )
-        # We can’t reliably count upserts without extra queries; return total rows processed.
-        inserted = len([r for r in rows if (r.get("name") or r.get("Name"))])
-        return inserted, updated
-    finally:
-        conn.close()
+    return jsonify({
+        "status": "ok",
+        "db_ok": db_ok,
+        "db_error": err,
+    }), 200
 
 
-def _import_job_types(rows):
-    """
-    Expected: name (required)
-    """
-    conn = get_db()
+@api_bp.post("/auth/login")
+def login():
+    # --- targeted logging (THIS IS WHERE IT GOES) ---
+    current_app.logger.info("LOGIN %s %s", request.method, request.path)
+    current_app.logger.info("LOGIN content_type=%s", request.content_type)
+
+    raw = request.data.decode("utf-8", errors="replace") if request.data else ""
+    current_app.logger.info("LOGIN raw_body=%s", raw)
+
+    parsed = request.get_json(silent=True)
+    current_app.logger.info("LOGIN parsed_json=%s", parsed)
+    # --- end targeted logging ---
+
+    data = parsed or {}
+
+    missing = require_fields(data, ["username", "totp"])
+    if missing:
+        return jsonify({
+            "error": "missing_fields",
+            "missing": missing,
+            "expected": ["username", "totp"],
+        }), 400
+
+    username = str(data.get("username")).strip()
+    totp_code = str(data.get("totp")).strip()
+
+    if (not totp_code.isdigit()) or (len(totp_code) != 6):
+        return jsonify({
+            "error": "invalid_totp_format",
+            "message": "totp must be a 6-digit code",
+        }), 400
+
+    # Fetch user
     try:
-        with conn:
-            with conn.cursor() as cur:
-                for r in rows:
-                    name = r.get("name") or r.get("Name")
-                    if not name:
-                        continue
-                    cur.execute(
-                        """
-                        INSERT INTO job_types (name)
-                        VALUES (%s)
-                        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-                        """,
-                        (name,),
-                    )
-        return len([r for r in rows if (r.get("name") or r.get("Name"))]), 0
-    finally:
-        conn.close()
+        user = db_get_user_by_username(username)
+    except Exception as e:
+        current_app.logger.exception("LOGIN db_get_user_by_username failed")
+        return jsonify({"error": "db_error", "message": str(e)}), 500
+
+    if not user:
+        return jsonify({"error": "invalid_credentials"}), 401
+
+    if not user.get("is_active", False):
+        return jsonify({"error": "inactive_user"}), 403
+
+    totp_secret = user.get("totp_secret")
+    if not totp_secret:
+        return jsonify({"error": "totp_not_configured"}), 409
+
+    # Verify TOTP (valid_window helps minor clock drift)
+    if not pyotp.TOTP(totp_secret).verify(totp_code, valid_window=1):
+        return jsonify({"error": "invalid_credentials"}), 401
+
+    # JWT
+    token = create_access_token(identity={
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+    })
+    return jsonify({"access_token": token}), 200
 
 
-def _import_turnout_types(rows):
+@api_bp.get("/auth/me")
+@jwt_required()
+def me():
+    ident = get_jwt_identity()
+    return jsonify({"identity": ident}), 200
+
+
+@api_bp.get("/refdata")
+@jwt_required()
+def refdata():
     """
-    Expected: code (required), name (optional)
-    Example: code=1, name=Code 1
+    Placeholder: return reference data.
+    Later: job_types, turnout_types, appliances, crew, equipment_items etc.
+    For now, return a stub so JWT testing is easy.
     """
-    conn = get_db()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                for r in rows:
-                    code = r.get("code") or r.get("Code")
-                    if not code:
-                        continue
-                    name = r.get("name") or r.get("Name") or None
-                    cur.execute(
-                        """
-                        INSERT INTO turnout_types (code, name)
-                        VALUES (%s, %s)
-                        ON CONFLICT (code) DO UPDATE
-                        SET name = EXCLUDED.name
-                        """,
-                        (code, name),
-                    )
-        return len([r for r in rows if (r.get("code") or r.get("Code"))]), 0
-    finally:
-        conn.close()
+    return jsonify({
+        "job_types": [],
+        "turnout_types": [],
+        "appliances": [],
+        "crew_members": [],
+    }), 200
 
 
-def _import_crew(rows):
-    """
-    Expected: name (required)
-    Optional: email, active
-    """
-    conn = get_db()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                for r in rows:
-                    name = r.get("name") or r.get("Name")
-                    if not name:
-                        continue
-                    email = r.get("email") or r.get("Email") or None
-                    active_raw = (r.get("active") or r.get("Active") or "true").lower()
-                    active = active_raw not in ("0", "false", "no", "n")
-
-                    cur.execute(
-                        """
-                        INSERT INTO crew_members (name, email, active)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (name) DO UPDATE
-                        SET email = EXCLUDED.email,
-                            active = EXCLUDED.active
-                        """,
-                        (name, email, active),
-                    )
-        return len([r for r in rows if (r.get("name") or r.get("Name"))]), 0
-    finally:
-        conn.close()
-
-
-def _import_equipment(rows):
-    """
-    Expected columns:
-    - appliance_id (required) OR appliance_name (required)
-    - name (required)
-    Optional:
-    - active
-    """
-    conn = get_db()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                for r in rows:
-                    name = r.get("name") or r.get("Name")
-                    if not name:
-                        continue
-
-                    appliance_id = r.get("appliance_id") or r.get("ApplianceId") or None
-                    appliance_name = r.get("appliance_name") or r.get("ApplianceName") or None
-
-                    if appliance_id:
-                        appliance_id = int(appliance_id)
-                    else:
-                        if not appliance_name:
-                            continue
-                        cur.execute("SELECT id FROM appliances WHERE name = %s", (appliance_name,))
-                        ap = cur.fetchone()
-                        if not ap:
-                            continue
-                        appliance_id = ap["id"]
-
-                    active_raw = (r.get("active") or r.get("Active") or "true").lower()
-                    active = active_raw not in ("0", "false", "no", "n")
-
-                    # assumes UNIQUE(appliance_id, name)
-                    cur.execute(
-                        """
-                        INSERT INTO equipment_items (appliance_id, name, active)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (appliance_id, name) DO UPDATE
-                        SET active = EXCLUDED.active
-                        """,
-                        (appliance_id, name, active),
-                    )
-        return len([r for r in rows if (r.get("name") or r.get("Name"))]), 0
-    finally:
-        conn.close()
-
-
-@bp.post("/admin/import/appliances")
-@admin_required
-def admin_import_appliances():
-    f, err = require_file("file")
-    if err:
-        return err
-    rows = parse_csv_upload(f)
-    total, _ = _import_appliances(rows)
-    return jsonify({"ok": True, "imported": total}), 200
-
-
-@bp.post("/admin/import/job-types")
-@admin_required
-def admin_import_job_types():
-    f, err = require_file("file")
-    if err:
-        return err
-    rows = parse_csv_upload(f)
-    total, _ = _import_job_types(rows)
-    return jsonify({"ok": True, "imported": total}), 200
-
-
-@bp.post("/admin/import/turnout-types")
-@admin_required
-def admin_import_turnout_types():
-    f, err = require_file("file")
-    if err:
-        return err
-    rows = parse_csv_upload(f)
-    total, _ = _import_turnout_types(rows)
-    return jsonify({"ok": True, "imported": total}), 200
-
-
-@bp.post("/admin/import/crew")
-@admin_required
-def admin_import_crew():
-    f, err = require_file("file")
-    if err:
-        return err
-    rows = parse_csv_upload(f)
-    total, _ = _import_crew(rows)
-    return jsonify({"ok": True, "imported": total}), 200
-
-
-@bp.post("/admin/import/equipment")
-@admin_required
-def admin_import_equipment():
-    f, err = require_file("file")
-    if err:
-        return err
-    rows = parse_csv_upload(f)
-    total, _ = _import_equipment(rows)
-    return jsonify({"ok": True, "imported": total}), 200
-
-
-# ----------------------------
-# Checklists: Post-job submit
-# ----------------------------
-
-@bp.post("/checklists/post-job")
+@api_bp.post("/checklists/post-job")
 @jwt_required()
 def submit_post_job():
     """
-    JSON:
-    {
-      "job_number": "string optional",
-      "job_type_id": int required,
-      "turnout_type_id": int required,
-      "appliance_id": int required,
-      "date_started": "ISO optional",
-      "date_finished": "ISO optional",
-      "location": "string optional",
-      "notes": "string optional",
-      "crew_member_ids": [int],
-      "equipment_item_ids": [int]
-    }
+    Placeholder submit route.
+    Adjust fields + inserts to match your actual schema.
     """
-    data, err = require_json()
-    if err:
-        return err
-
-    required = ["job_type_id", "turnout_type_id", "appliance_id"]
-    missing = [k for k in required if data.get(k) in (None, "", [])]
+    data = json_body()
+    # minimal set; adjust to your real required fields
+    missing = require_fields(data, ["job_type_id", "turnout_type_id", "appliance_id"])
     if missing:
-        return jsonify({"error": "Missing required fields", "missing": missing}), 400
+        return jsonify({"error": "missing_fields", "missing": missing}), 400
 
-    crew_member_ids = data.get("crew_member_ids") or []
-    equipment_item_ids = data.get("equipment_item_ids") or []
-    if not isinstance(crew_member_ids, list) or not all(isinstance(x, int) for x in crew_member_ids):
-        return jsonify({"error": "crew_member_ids must be list[int]"}), 400
-    if not isinstance(equipment_item_ids, list) or not all(isinstance(x, int) for x in equipment_item_ids):
-        return jsonify({"error": "equipment_item_ids must be list[int]"}), 400
+    ident = get_jwt_identity()
+    user_id = ident.get("id") if isinstance(ident, dict) else None
+    if not user_id:
+        return jsonify({"error": "invalid_jwt_identity"}), 401
 
-    def parse_dt(s):
-        if not s:
-            return None
-        try:
-            s2 = str(s).replace("Z", "+00:00")
-            return datetime.fromisoformat(s2)
-        except Exception:
-            return None
-
-    date_started = parse_dt(data.get("date_started"))
-    date_finished = parse_dt(data.get("date_finished"))
-
-    identity = get_jwt_identity()
-    user_id = identity.get("user_id") if isinstance(identity, dict) else identity
-
-    conn = get_db()
     try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO post_job_submissions
-                    (job_number, job_type_id, turnout_type_id, appliance_id,
-                     date_started, date_finished, location, notes,
-                     created_by_user_id, created_at)
-                    VALUES
-                    (%s,%s,%s,%s,
-                     %s,%s,%s,%s,
-                     %s,%s)
-                    RETURNING id
-                    """,
-                    (
-                        data.get("job_number"),
-                        int(data["job_type_id"]),
-                        int(data["turnout_type_id"]),
-                        int(data["appliance_id"]),
-                        date_started,
-                        date_finished,
-                        data.get("location"),
-                        data.get("notes"),
-                        user_id,
-                        _now_utc(),
-                    ),
-                )
-                submission_id = cur.fetchone()["id"]
+        submission_id = db_insert_post_job_submission(data, submitted_by_user_id=int(user_id))
+    except Exception as e:
+        current_app.logger.exception("POST-JOB insert failed")
+        return jsonify({"error": "db_error", "message": str(e)}), 500
 
-                if crew_member_ids:
-                    cur.executemany(
-                        """
-                        INSERT INTO post_job_submission_crew (submission_id, crew_member_id)
-                        VALUES (%s, %s)
-                        """,
-                        [(submission_id, int(cid)) for cid in crew_member_ids],
-                    )
-
-                if equipment_item_ids:
-                    cur.executemany(
-                        """
-                        INSERT INTO post_job_submission_items (submission_id, equipment_item_id)
-                        VALUES (%s, %s)
-                        """,
-                        [(submission_id, int(eid)) for eid in equipment_item_ids],
-                    )
-
-        return jsonify({"ok": True, "submission_id": submission_id}), 201
-    finally:
-        conn.close()
+    return jsonify({"ok": True, "submission_id": submission_id}), 201
 
 
-# ----------------------------
-# Admin: view submissions
-# ----------------------------
-
-@bp.get("/admin/checklists/post-job/submissions")
-@admin_required
-def list_post_job_submissions():
+@api_bp.get("/admin/checklists/post-job/submissions")
+@jwt_required()
+def admin_list_post_job():
     """
-    Returns basic submission list with linked crew + equipment ids.
+    Placeholder admin list.
+    You can later enforce role-based access (role == 'admin').
     """
-    conn = get_db()
+    ident = get_jwt_identity()
+    role = ident.get("role") if isinstance(ident, dict) else None
+    if role not in ("admin", "superadmin"):
+        return jsonify({"error": "forbidden", "message": "admin role required"}), 403
+
+    limit_raw = request.args.get("limit", "50")
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                  s.*,
-                  jt.name AS job_type_name,
-                  tt.code AS turnout_type_code,
-                  a.name AS appliance_name
-                FROM post_job_submissions s
-                LEFT JOIN job_types jt ON jt.id = s.job_type_id
-                LEFT JOIN turnout_types tt ON tt.id = s.turnout_type_id
-                LEFT JOIN appliances a ON a.id = s.appliance_id
-                ORDER BY s.id DESC
-                LIMIT 200
-                """
-            )
-            subs = cur.fetchall()
+        limit = max(1, min(200, int(limit_raw)))
+    except ValueError:
+        limit = 50
 
-            # attach crew + equipment
-            sub_ids = [s["id"] for s in subs]
-            crew_map = {sid: [] for sid in sub_ids}
-            eq_map = {sid: [] for sid in sub_ids}
+    try:
+        rows = db_list_post_job_submissions(limit=limit)
+    except Exception as e:
+        current_app.logger.exception("ADMIN list submissions failed")
+        return jsonify({"error": "db_error", "message": str(e)}), 500
 
-            if sub_ids:
-                cur.execute(
-                    """
-                    SELECT submission_id, crew_member_id
-                    FROM post_job_submission_crew
-                    WHERE submission_id = ANY(%s)
-                    """,
-                    (sub_ids,),
-                )
-                for r in cur.fetchall():
-                    crew_map[r["submission_id"]].append(r["crew_member_id"])
-
-                cur.execute(
-                    """
-                    SELECT submission_id, equipment_item_id
-                    FROM post_job_submission_items
-                    WHERE submission_id = ANY(%s)
-                    """,
-                    (sub_ids,),
-                )
-                for r in cur.fetchall():
-                    eq_map[r["submission_id"]].append(r["equipment_item_id"])
-
-            for s in subs:
-                sid = s["id"]
-                s["crew_member_ids"] = crew_map.get(sid, [])
-                s["equipment_item_ids"] = eq_map.get(sid, [])
-
-        return jsonify({"submissions": subs}), 200
-    finally:
-        conn.close()
+    return jsonify({"submissions": rows}), 200
