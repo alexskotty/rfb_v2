@@ -4,3 +4,5 @@ gunicorn==22.0.0
 python-dotenv==1.0.1
 pyotp==2.9.0
 psycopg[binary]==3.2.13
+pyjwt==2.10.1
+cryptography==42.0.8
