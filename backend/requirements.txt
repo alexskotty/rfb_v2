@@ -1,17 +1,12 @@
 Flask==3.0.3
 gunicorn==22.0.0
 
-# Database
 psycopg2-binary==2.9.9
 
-# Auth / Security
 flask-jwt-extended==4.6.0
+flask-cors==4.0.1
+
 pyotp==2.9.0
 qrcode==7.4.2
 
-# API / Utilities
-flask-cors==4.0.1
 python-dotenv==1.0.1
-
-# CSV / Data handling
-pandas==2.2.2
