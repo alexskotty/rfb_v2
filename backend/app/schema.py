@@ -44,7 +44,7 @@ create table if not exists crew_members (
 
 create table if not exists appliances (
   id bigserial primary key,
-  code text not null unique,      -- e.g. "P1", "TANKER"
+  code text not null unique,      -- e.g. "PUMPER", "TANK1"
   name text not null,             -- display label
   is_active boolean not null default true
 );
@@ -58,6 +58,12 @@ create table if not exists equipment_items (
 );
 
 create table if not exists job_types (
+  id bigserial primary key,
+  name text not null unique,
+  is_active boolean not null default true
+);
+
+create table if not exists turnout_types (
   id bigserial primary key,
   name text not null unique,
   is_active boolean not null default true
@@ -102,10 +108,7 @@ create index if not exists idx_post_job_items_submission on post_job_submission_
 """
 
 def ensure_schema():
-    """
-    Creates all required tables if they don't already exist.
-    Safe to run on every app start.
-    """
+    """Creates all required tables if they don't already exist."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)

@@ -34,7 +34,6 @@ def db_check():
 # Helpers
 # -------------------------
 def _client_ip():
-    # basic; can improve later using Render/Cloudflare headers
     return request.headers.get("X-Forwarded-For", request.remote_addr)
 
 def _audit(action: str, actor_user_id=None, target=None):
@@ -80,6 +79,17 @@ def _bootstrap_ok():
     provided = request.headers.get("X-Admin-Bootstrap-Key", "")
     return bool(expected) and safe_equals(expected, provided)
 
+def _read_uploaded_csv():
+    """
+    Reads multipart upload under field name 'file', returns (reader, raw_text).
+    """
+    if "file" not in request.files:
+        return None, None
+    f = request.files["file"]
+    raw = f.read().decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(raw))
+    return reader, raw
+
 
 # -------------------------
 # Auth: Login (username + TOTP) => JWT
@@ -90,7 +100,6 @@ def auth_login():
     username = (data.get("username") or "").strip().lower()
     code = (data.get("code") or "").strip()
 
-    # Generic failures to reduce user enumeration
     if not username or not code:
         return jsonify({"error": "invalid_login"}), 400
 
@@ -114,17 +123,13 @@ def auth_login():
     if not totp.verify(code, valid_window=1):
         return jsonify({"error": "invalid_login"}), 401
 
-    token = sign_jwt(
-        {"user_id": user_id, "username": username, "role": role},
-        ttl_seconds=8 * 3600
-    )
+    token = sign_jwt({"user_id": user_id, "username": username, "role": role}, ttl_seconds=8 * 3600)
     _audit("login_success", actor_user_id=user_id, target=f"user:{username}")
     return jsonify({"access_token": token, "token_type": "bearer"}), 200
 
 
 # -------------------------
 # Admin: Create user (bootstrap header OR admin JWT)
-# Creates user + enrol token + otpauth_uri
 # -------------------------
 @bp.post("/admin/users")
 def admin_create_user():
@@ -140,7 +145,6 @@ def admin_create_user():
     if not username or not display_name or role not in ("standard", "admin"):
         return jsonify({"error": "invalid_input"}), 400
 
-    # Generate secret for enrolment
     secret = pyotp.random_base32()
     secret_enc = encrypt_str(secret)
 
@@ -151,7 +155,6 @@ def admin_create_user():
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # create user with no totp secret yet
                 cur.execute(
                     """
                     insert into users(username, display_name, role, is_active, totp_secret_enc)
@@ -161,8 +164,6 @@ def admin_create_user():
                     (username, display_name, role),
                 )
                 user_id = cur.fetchone()[0]
-
-                # store enrol token + secret until confirmed
                 cur.execute(
                     """
                     insert into enrol_tokens(user_id, token_hash, totp_secret_enc, expires_at)
@@ -215,7 +216,7 @@ def enrol_get(token):
     if not row:
         return jsonify({"error": "invalid_token"}), 404
 
-    user_id, secret_enc, expires_at, used_at, username = row
+    _, secret_enc, expires_at, used_at, username = row
     if used_at is not None:
         return jsonify({"error": "token_used"}), 400
     if expires_at < now:
@@ -224,12 +225,11 @@ def enrol_get(token):
     secret = decrypt_str(secret_enc)
     issuer = os.getenv("TOTP_ISSUER", "Rutherglen Fire Brigade")
     otpauth_uri = pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name=issuer)
-
     return jsonify({"username": username, "otpauth_uri": otpauth_uri}), 200
 
 
 # -------------------------
-# Enrolment: confirm first code -> activates user TOTP secret
+# Enrolment: confirm code -> activates user TOTP secret
 # -------------------------
 @bp.post("/enrol/confirm")
 def enrol_confirm():
@@ -270,7 +270,6 @@ def enrol_confirm():
             if not totp.verify(code, valid_window=1):
                 return jsonify({"error": "invalid_code"}), 400
 
-            # Activate
             cur.execute("update users set totp_secret_enc = %s where id = %s", (secret_enc, user_id))
             cur.execute("update enrol_tokens set used_at = now() where id = %s", (enrol_id,))
         conn.commit()
@@ -307,7 +306,6 @@ def admin_reset_mfa(username):
                 return jsonify({"error": "not_found"}), 404
             user_id = r[0]
 
-            # Clear existing secret until re-enrolled
             cur.execute("update users set totp_secret_enc = null where id = %s", (user_id,))
             cur.execute(
                 """
@@ -332,7 +330,7 @@ def admin_reset_mfa(username):
 
 
 # -------------------------
-# Reference data (read-only for any logged-in user)
+# Reference data (read-only for logged-in users)
 # -------------------------
 @bp.get("/refdata")
 def get_refdata():
@@ -351,7 +349,15 @@ def get_refdata():
             cur.execute("select name from job_types where is_active = true order by name;")
             job_types = [r[0] for r in cur.fetchall()]
 
-    return jsonify({"crew": crew, "appliances": appliances, "job_types": job_types}), 200
+            cur.execute("select name from turnout_types where is_active = true order by name;")
+            turnout_types = [r[0] for r in cur.fetchall()]
+
+    return jsonify({
+        "crew": crew,
+        "appliances": appliances,
+        "job_types": job_types,
+        "turnout_types": turnout_types
+    }), 200
 
 
 @bp.get("/appliances/<int:appliance_id>/equipment")
@@ -376,7 +382,7 @@ def get_appliance_equipment(appliance_id: int):
 
 
 # -------------------------
-# Admin-managed reference data (CRUD-lite)
+# Admin: Single-item endpoints (handy for quick edits)
 # -------------------------
 @bp.post("/admin/crew")
 def admin_add_crew():
@@ -421,6 +427,29 @@ def admin_add_job_type():
         return jsonify({"error": "already_exists"}), 409
 
     _audit("admin_add_job_type", actor_user_id=admin["user_id"], target=f"job_type:{name}")
+    return jsonify({"status": "created", "name": name}), 201
+
+
+@bp.post("/admin/turnout-types")
+def admin_add_turnout_type():
+    admin = _require_admin()
+    if not admin:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "invalid_input"}), 400
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("insert into turnout_types(name, is_active) values (%s, true)", (name,))
+            conn.commit()
+    except UniqueViolation:
+        return jsonify({"error": "already_exists"}), 409
+
+    _audit("admin_add_turnout_type", actor_user_id=admin["user_id"], target=f"turnout_type:{name}")
     return jsonify({"status": "created", "name": name}), 201
 
 
@@ -494,27 +523,21 @@ def admin_add_equipment(appliance_id: int):
 
 
 # -------------------------
-# Admin: CSV import (crew)
-# Form field: file
-# CSV header: name
+# Admin: CSV import endpoints (multipart/form-data field "file")
 # -------------------------
+
 @bp.post("/admin/import/crew")
 def admin_import_crew():
     admin = _require_admin()
     if not admin:
         return jsonify({"error": "unauthorized"}), 401
 
-    if "file" not in request.files:
+    reader, _ = _read_uploaded_csv()
+    if reader is None:
         return jsonify({"error": "missing_file"}), 400
-
-    f = request.files["file"]
-    raw = f.read().decode("utf-8", errors="replace")
-
-    reader = csv.DictReader(io.StringIO(raw))
 
     inserted = 0
     skipped = 0
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             for row in reader:
@@ -531,3 +554,165 @@ def admin_import_crew():
 
     _audit("admin_import_crew", actor_user_id=admin["user_id"], target=f"inserted:{inserted},skipped:{skipped}")
     return jsonify({"status": "ok", "inserted": inserted, "skipped": skipped}), 200
+
+
+@bp.post("/admin/import/job-types")
+def admin_import_job_types():
+    admin = _require_admin()
+    if not admin:
+        return jsonify({"error": "unauthorized"}), 401
+
+    reader, _ = _read_uploaded_csv()
+    if reader is None:
+        return jsonify({"error": "missing_file"}), 400
+
+    inserted = 0
+    skipped = 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for row in reader:
+                name = (row.get("name") or "").strip()
+                if not name:
+                    skipped += 1
+                    continue
+                try:
+                    cur.execute("insert into job_types(name, is_active) values (%s, true)", (name,))
+                    inserted += 1
+                except UniqueViolation:
+                    skipped += 1
+            conn.commit()
+
+    _audit("admin_import_job_types", actor_user_id=admin["user_id"], target=f"inserted:{inserted},skipped:{skipped}")
+    return jsonify({"status": "ok", "inserted": inserted, "skipped": skipped}), 200
+
+
+@bp.post("/admin/import/turnout-types")
+def admin_import_turnout_types():
+    admin = _require_admin()
+    if not admin:
+        return jsonify({"error": "unauthorized"}), 401
+
+    reader, _ = _read_uploaded_csv()
+    if reader is None:
+        return jsonify({"error": "missing_file"}), 400
+
+    inserted = 0
+    skipped = 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for row in reader:
+                name = (row.get("name") or "").strip()
+                if not name:
+                    skipped += 1
+                    continue
+                try:
+                    cur.execute("insert into turnout_types(name, is_active) values (%s, true)", (name,))
+                    inserted += 1
+                except UniqueViolation:
+                    skipped += 1
+            conn.commit()
+
+    _audit("admin_import_turnout_types", actor_user_id=admin["user_id"], target=f"inserted:{inserted},skipped:{skipped}")
+    return jsonify({"status": "ok", "inserted": inserted, "skipped": skipped}), 200
+
+
+@bp.post("/admin/import/appliances")
+def admin_import_appliances():
+    admin = _require_admin()
+    if not admin:
+        return jsonify({"error": "unauthorized"}), 401
+
+    reader, _ = _read_uploaded_csv()
+    if reader is None:
+        return jsonify({"error": "missing_file"}), 400
+
+    inserted = 0
+    skipped = 0
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for row in reader:
+                code = (row.get("code") or "").strip().upper()
+                name = (row.get("name") or "").strip()
+                if not code or not name:
+                    skipped += 1
+                    continue
+                try:
+                    cur.execute("insert into appliances(code, name, is_active) values (%s, %s, true)", (code, name))
+                    inserted += 1
+                except UniqueViolation:
+                    skipped += 1
+            conn.commit()
+
+    _audit("admin_import_appliances", actor_user_id=admin["user_id"], target=f"inserted:{inserted},skipped:{skipped}")
+    return jsonify({"status": "ok", "inserted": inserted, "skipped": skipped}), 200
+
+
+@bp.post("/admin/import/equipment")
+def admin_import_equipment():
+    """
+    CSV columns required:
+      appliance_code, name
+    Optional:
+      sort_order
+
+    Example row:
+      PUMPER,BA Set,10
+    """
+    admin = _require_admin()
+    if not admin:
+        return jsonify({"error": "unauthorized"}), 401
+
+    reader, _ = _read_uploaded_csv()
+    if reader is None:
+        return jsonify({"error": "missing_file"}), 400
+
+    inserted = 0
+    skipped = 0
+    missing_appliance = 0
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for row in reader:
+                appliance_code = (row.get("appliance_code") or "").strip().upper()
+                name = (row.get("name") or "").strip()
+                sort_order_raw = (row.get("sort_order") or "0").strip()
+
+                if not appliance_code or not name:
+                    skipped += 1
+                    continue
+
+                try:
+                    sort_order = int(sort_order_raw) if sort_order_raw else 0
+                except Exception:
+                    sort_order = 0
+
+                cur.execute("select id from appliances where code = %s", (appliance_code,))
+                r = cur.fetchone()
+                if not r:
+                    missing_appliance += 1
+                    continue
+
+                appliance_id = r[0]
+                try:
+                    cur.execute(
+                        "insert into equipment_items(appliance_id, name, sort_order) values (%s, %s, %s)",
+                        (appliance_id, name, sort_order),
+                    )
+                    inserted += 1
+                except UniqueViolation:
+                    skipped += 1
+
+            conn.commit()
+
+    _audit(
+        "admin_import_equipment",
+        actor_user_id=admin["user_id"],
+        target=f"inserted:{inserted},skipped:{skipped},missing_appliance:{missing_appliance}"
+    )
+    return jsonify({
+        "status": "ok",
+        "inserted": inserted,
+        "skipped": skipped,
+        "missing_appliance": missing_appliance
+    }), 200
