@@ -32,7 +32,7 @@ services:
 
   - type: web
     name: rfb-v2-web
-    env: static
+    env: basic
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
