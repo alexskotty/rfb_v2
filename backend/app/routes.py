@@ -40,23 +40,17 @@ def _connect():
     return psycopg.connect(db_url, row_factory=dict_row)
 
 
-def db_get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
-    """
-    Expected users table columns:
-      id, username, totp_secret, role, is_active
-    """
+def db_get_user_by_username(username: str):
     sql = """
-        SELECT id, username, totp_secret, role, is_active
+        SELECT id, username, display_name, role, is_active, totp_secret
         FROM users
         WHERE username = %s
         LIMIT 1
-        totp_secret = user.get("totp_secret")
     """
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (username,))
-            row = cur.fetchone()
-            return row
+            return cur.fetchone()
 
 
 def db_insert_post_job_submission(payload: Dict[str, Any], submitted_by_user_id: int) -> int:
