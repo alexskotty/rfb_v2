@@ -3,4 +3,4 @@ flask-cors==4.0.1
 gunicorn==22.0.0
 python-dotenv==1.0.1
 pyotp==2.9.0
-psycopg[binary]==3.2.1
+psycopg[binary]==3.2.13
