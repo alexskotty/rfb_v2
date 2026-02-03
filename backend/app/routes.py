@@ -50,6 +50,7 @@ def db_get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
         FROM users
         WHERE username = %s
         LIMIT 1
+        totp_secret = user.get("totp_secret")
     """
     with _connect() as conn:
         with conn.cursor() as cur:
