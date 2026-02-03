@@ -2,6 +2,7 @@ services:
   - type: web
     name: rfb-v2-api
     runtime: python
+    plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn wsgi:app
@@ -9,13 +10,10 @@ services:
     envVars:
       - key: SECRET_KEY
         generateValue: true
-
-      # Render injects this from the Postgres we define below
       - key: DATABASE_URL
         fromDatabase:
           name: rfb-v2-db
           property: connectionString
-
       - key: MAIL_TO
         value: admin@rutherglenfb.com.au
       - key: SMTP_HOST
