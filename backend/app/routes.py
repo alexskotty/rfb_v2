@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pyotp
 from flask import Blueprint, jsonify, request
-from psycopg.errors import UniqueViolation
+from psycopg2.errors import UniqueViolation
 
 from .db import get_conn
 from .security import encrypt_str, decrypt_str, hash_token, sign_jwt, verify_jwt, safe_equals
