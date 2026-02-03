@@ -16,31 +16,10 @@ services:
           property: connectionString
       - key: MAIL_TO
         value: admin@rutherglenfb.com.au
-      - key: SMTP_HOST
-        sync: false
-      - key: SMTP_PORT
-        sync: false
-      - key: SMTP_USER
-        sync: false
-      - key: SMTP_PASS
-        sync: false
-      - key: MAIL_FROM
-        sync: false
       - key: CORS_ORIGINS
-        sync: false
+        value: "*"
       - key: TOTP_ISSUER
         value: Rutherglen Fire Brigade
-
-  - type: web
-    name: rfb-v2-web
-    runtime: static
-    rootDir: frontend
-    buildCommand: npm ci && npm run build
-    staticPublishPath: dist
-    autoDeploy: true
-    envVars:
-      - key: VITE_API_BASE_URL
-        sync: false
 
 databases:
   - name: rfb-v2-db
