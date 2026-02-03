@@ -1,17 +1,33 @@
 from flask import Flask
+from flask_jwt_extended import JWTManager
 from flask_cors import CORS
-from .config import Config
-from .routes import bp
-from .schema import ensure_schema
+
 
 def create_app():
     app = Flask(__name__)
-    app.config.from_object(Config)
 
-    CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}})
+    # -------------------------------------------------
+    # Configuration
+    # -------------------------------------------------
+    app.config["JWT_SECRET_KEY"] = "CHANGE_ME_IN_ENV"  # use env var in prod
+    app.config["JSON_SORT_KEYS"] = False
 
-    # Ensure DB schema exists
-    ensure_schema()
+    # -------------------------------------------------
+    # Extensions
+    # -------------------------------------------------
+    JWTManager(app)
+    CORS(app)
 
-    app.register_blueprint(bp)
+    # -------------------------------------------------
+    # API Blueprint (THIS IS YOUR MAIN API)
+    # -------------------------------------------------
+    from .routes import bp as api_bp
+    app.register_blueprint(api_bp, url_prefix="/api")
+
+    # -------------------------------------------------
+    # Canary Blueprint (DEPLOYMENT CHECK)
+    # -------------------------------------------------
+    from .canary import canary_bp
+    app.register_blueprint(canary_bp, url_prefix="/api")
+
     return app
