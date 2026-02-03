@@ -1,8 +1,8 @@
 Flask==3.0.3
 gunicorn==22.0.0
 
-# Postgres driver (psycopg v3 — matches `from psycopg...`)
-psycopg==3.2.1
+# Postgres driver (psycopg v3 with bundled binary wheels)
+psycopg[binary]==3.2.1
 
 flask-jwt-extended==4.6.0
 flask-cors==4.0.1
