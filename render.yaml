@@ -1,7 +1,7 @@
 services:
   - type: web
     name: rfb-v2-api
-    env: python
+    runtime: python
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn wsgi:app
@@ -32,7 +32,7 @@ services:
 
   - type: web
     name: rfb-v2-web
-    env: basic
+    runtime: static
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
@@ -43,4 +43,4 @@ services:
 
 databases:
   - name: rfb-v2-db
-    plan: starter
+    plan: basic-256mb
