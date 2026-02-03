@@ -10,6 +10,18 @@ from .security import encrypt_str, decrypt_str, hash_token, sign_jwt, verify_jwt
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
+@bp.get("/debug/bootstrap")
+def debug_bootstrap():
+    expected = os.getenv("ADMIN_BOOTSTRAP_KEY", "")
+    provided = request.headers.get("X-Admin-Bootstrap-Key", "")
+    return jsonify({
+        "has_expected": bool(expected),
+        "expected_len": len(expected),
+        "provided_len": len(provided),
+        "match": bool(expected) and safe_equals(expected, provided),
+    })
+
+
 # -------------------------
 # Basics
 # -------------------------
